@@ -1,5 +1,6 @@
 //! Main VectorDB API
 
+use crate::distance::calculate_distance;
 use crate::error::{Result, VectorDbError};
 use crate::index::{HnswConfig, HnswIndex};
 use crate::storage::Storage;
@@ -117,8 +118,42 @@ impl VectorDB {
             });
         }
 
+        let user_k = query.k;
+        let has_filters = query.filters.as_ref().map_or(false, |f| !f.is_empty());
+
+        // Post-filter overfetch. When metadata filters are present, the
+        // index returns top-K by raw distance and we trim to matching
+        // metadata afterwards. With imbalanced bucket sizes (production
+        // reality: a single dominant `node_type` swamps top-K, while small
+        // buckets at 4-8 % of corpus get ~zero hits even for k=10), small
+        // buckets return zero unless we expand the candidate pool. Match
+        // the application-layer overfetch policy that downstream callers
+        // (e.g. Atlas Data Fabric `filter_pushdown.go`) already use:
+        // Factor=20, Min=500, Cap=2000. Without filters this is a no-op.
+        const OVERFETCH_FACTOR: usize = 20;
+        const OVERFETCH_MIN: usize = 500;
+        const OVERFETCH_CAP: usize = 2000;
+        let fetch_k = if has_filters {
+            user_k
+                .saturating_mul(OVERFETCH_FACTOR)
+                .max(OVERFETCH_MIN)
+                .min(OVERFETCH_CAP)
+        } else {
+            user_k
+        };
+
+        // Build a derived query that drives the index toward the larger
+        // candidate pool. `ef_search` mirrors `k` so the inner search
+        // visits enough nodes (the index respects `max(ef, k)` since the
+        // companion fix in `index::HnswIndex::search`).
+        let mut fetch_query = query.clone();
+        fetch_query.k = fetch_k;
+        if fetch_k > query.ef_search.unwrap_or(0) {
+            fetch_query.ef_search = Some(fetch_k);
+        }
+
         // Search index
-        let mut results = self.index.search(&query)?;
+        let mut results = self.index.search(&fetch_query)?;
 
         // Enrich results with metadata if needed
         for result in &mut results {
@@ -136,12 +171,89 @@ impl VectorDB {
             });
         }
 
+        // Brute-force fallback. Even with the overfetch above, post-filter
+        // top-K cannot reliably surface vectors from very small buckets
+        // (e.g. one-of-a-kind `node_type` values like a singleton schema
+        // record). When the fast path under-delivers — i.e. we asked for
+        // `user_k` matches but got fewer — fall back to a full scan over
+        // the storage layer, filtering by metadata and ranking by distance
+        // to the query. O(n) in total vectors but only fires for the
+        // filtered path on small buckets, where it's both fast (matching
+        // set is small) and necessary (HNSW post-filter can't find them).
+        if has_filters && results.len() < user_k {
+            let bf_results = self.brute_force_filtered_search(&query)?;
+            // bf_results already ranked ascending by distance; replace.
+            results = bf_results;
+        }
+
+        // Trim back to the caller's requested k after post-filter.
+        results.truncate(user_k);
+
         // Update stats
         let latency_us = start.elapsed().as_micros() as f64;
         let mut stats = self.stats.write();
         stats.avg_query_latency_us = (stats.avg_query_latency_us * 0.9) + (latency_us * 0.1);
 
         Ok(results)
+    }
+
+    /// Exhaustive filtered search over the storage layer. Used as the
+    /// guaranteed-correctness fallback when HNSW + post-filter under-
+    /// delivers (typically: requested filter matches a very small bucket
+    /// that the top-K HNSW pool cannot represent). Iterates every stored
+    /// id, applies the metadata filter, computes distance to the query,
+    /// returns the top-K by ascending distance.
+    fn brute_force_filtered_search(&self, query: &SearchQuery) -> Result<Vec<SearchResult>> {
+        let filters = match query.filters.as_ref() {
+            Some(f) if !f.is_empty() => f,
+            _ => return Ok(Vec::new()),
+        };
+
+        let mut hits: Vec<SearchResult> = Vec::new();
+        for id in self.storage.get_all_ids()? {
+            let metadata = match self.storage.get_metadata(&id)? {
+                Some(m) => m,
+                None => continue,
+            };
+
+            let matches = filters.iter().all(|(key, value)| {
+                metadata.get(key).map(|v| v == value).unwrap_or(false)
+            });
+            if !matches {
+                continue;
+            }
+
+            let vec = match self.storage.get(&id)? {
+                Some(v) => v,
+                None => continue,
+            };
+
+            let dist =
+                calculate_distance(&query.vector, &vec, self.config.distance_metric)
+                    .unwrap_or(f32::MAX);
+
+            if let Some(threshold) = query.threshold {
+                if dist > threshold {
+                    continue;
+                }
+            }
+
+            hits.push(SearchResult {
+                id,
+                score: dist,
+                metadata,
+                vector: None,
+            });
+        }
+
+        hits.sort_by(|a, b| {
+            a.score
+                .partial_cmp(&b.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        hits.truncate(query.k);
+
+        Ok(hits)
     }
 
     /// Delete a vector by ID
