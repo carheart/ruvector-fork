@@ -219,6 +219,23 @@ impl GraphStorage {
         Ok(next)
     }
 
+    /// Atlas FR-32: restore the LSN counter to a specific value during
+    /// snapshot import. Distinct from `bump_lsn_in_txn` which only ever
+    /// increments — this overwrites in its own write_txn so the
+    /// post-import counter equals the snapshot's captured LSN. The
+    /// snapshot import has already replayed the data, so a single
+    /// metadata-table write captures the watermark with no further
+    /// state churn.
+    pub fn restore_lsn(&self, lsn: u64) -> Result<()> {
+        let write_txn = self.begin_write_txn()?;
+        {
+            let mut meta = write_txn.open_table(METADATA_TABLE)?;
+            meta.insert(META_KEY_LSN, lsn.to_string().as_str())?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
     /// Read the current LSN (FR-12 backing primitive). Reads the
     /// committed value so a writer mid-transaction is not observed.
     pub fn current_lsn(&self) -> Result<u64> {

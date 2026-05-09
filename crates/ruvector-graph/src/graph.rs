@@ -95,6 +95,17 @@ impl GraphDB {
         }
     }
 
+    /// Restore the underlying storage's LSN to a specific value (Atlas
+    /// FR-32). Used by snapshot import to re-anchor the LSN watermark
+    /// after data restore. No-op when the GraphDB is in-memory.
+    #[cfg(feature = "storage")]
+    pub fn restore_lsn(&self, lsn: u64) -> anyhow::Result<()> {
+        match &self.storage {
+            Some(s) => s.restore_lsn(lsn),
+            None => Ok(()),
+        }
+    }
+
     /// Load all data from storage into memory
     #[cfg(feature = "storage")]
     fn load_from_storage(&mut self) -> anyhow::Result<()> {
