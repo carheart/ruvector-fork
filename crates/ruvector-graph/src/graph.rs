@@ -376,6 +376,19 @@ impl GraphDB {
         Ok(deleted)
     }
 
+    /// List all hyperedges in the graph
+    pub fn list_hyperedges(&self) -> Vec<Hyperedge> {
+        self.hyperedges
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect()
+    }
+
+    /// Get all distinct node labels in the graph
+    pub fn get_all_labels(&self) -> Vec<String> {
+        self.label_index.all_labels()
+    }
+
     // Statistics
 
     /// Get the number of nodes
