@@ -32,7 +32,7 @@ pub use graph::GraphDB;
 pub use hyperedge::{Hyperedge, HyperedgeBuilder, HyperedgeId};
 pub use node::{Node, NodeBuilder};
 #[cfg(feature = "storage")]
-pub use storage::GraphStorage;
+pub use storage::{DigestCheck, GraphStorage, StorageDurability};
 pub use transaction::{IsolationLevel, Transaction, TransactionManager};
 pub use types::{EdgeId, Label, NodeId, Properties, PropertyValue, RelationType};
 

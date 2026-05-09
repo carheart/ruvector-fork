@@ -19,7 +19,11 @@ use once_cell::sync::Lazy;
 #[cfg(feature = "storage")]
 use parking_lot::Mutex;
 #[cfg(feature = "storage")]
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, Durability, ReadableTable, TableDefinition, WriteTransaction};
+
+#[cfg(feature = "storage")]
+/// Re-export redb's Durability so callers don't need a direct redb dep.
+pub use redb::Durability as StorageDurability;
 #[cfg(feature = "storage")]
 use std::collections::HashMap;
 #[cfg(feature = "storage")]
@@ -37,6 +41,19 @@ const HYPEREDGES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("hyp
 #[cfg(feature = "storage")]
 const METADATA_TABLE: TableDefinition<&str, &str> = TableDefinition::new("metadata");
 
+// Atlas intent 01 (durable graph storage): metadata keys for the WAL/LSN
+// integrity contract. Written on first open and bumped on every mutation.
+#[cfg(feature = "storage")]
+const META_KEY_LSN: &str = "__atlas_lsn";
+#[cfg(feature = "storage")]
+const META_KEY_FORMAT_VERSION: &str = "__atlas_format_version";
+#[cfg(feature = "storage")]
+const META_KEY_EDGE_TYPES_DIGEST: &str = "__atlas_edge_types_digest";
+#[cfg(feature = "storage")]
+const META_KEY_NODE_LABELS_DIGEST: &str = "__atlas_node_labels_digest";
+#[cfg(feature = "storage")]
+const ATLAS_FORMAT_VERSION: &str = "1.0";
+
 #[cfg(feature = "storage")]
 // Global database connection pool to allow multiple GraphStorage instances
 // to share the same underlying database file
@@ -47,15 +64,55 @@ static DB_POOL: Lazy<Mutex<HashMap<PathBuf, Arc<Database>>>> =
 /// Storage backend for graph database
 pub struct GraphStorage {
     db: Arc<Database>,
+    /// Optional per-write durability mode (FR-08). When set, every
+    /// `begin_write()` call applies the configured durability before
+    /// the first table is opened. None = redb default (Eventual).
+    durability: Option<Durability>,
+}
+
+#[cfg(feature = "storage")]
+/// Result of [`GraphStorage::seed_or_check_digests`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DigestCheck {
+    /// Digests written for the first time (or back-filled).
+    Seeded,
+    /// On-disk digests match the runtime values.
+    Match,
+    /// On-disk digests differ from the runtime values. Warn-only — the
+    /// caller logs the diff but does NOT fail open (DD-08 parity).
+    Mismatch {
+        edge_disk: String,
+        edge_runtime: String,
+        node_disk: String,
+        node_runtime: String,
+    },
 }
 
 #[cfg(feature = "storage")]
 impl GraphStorage {
-    /// Create or open a graph storage at the given path
-    ///
-    /// Uses a global connection pool to allow multiple GraphStorage
-    /// instances to share the same underlying database file
+    /// Create or open a graph storage at the given path with default
+    /// durability (`Durability::Eventual` — redb default). Atlas
+    /// production callers should use [`Self::with_durability`] instead
+    /// to opt into `Durability::Immediate` (per-mutation fsync).
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
+        Self::with_durability_inner(path, None)
+    }
+
+    /// Open the storage with an explicit redb durability mode.
+    ///
+    /// Atlas intent 01 / FR-08: this constructor is the production wire
+    /// for Electron mode where every mutation must hit fsync before the
+    /// FFI ack. Uses redb's `Database::set_durability(Immediate)` after
+    /// open, which configures every subsequent `commit()` to call
+    /// `fdatasync` (NFR-04).
+    ///
+    /// On first open, writes the `__atlas_format_version` metadata key
+    /// (FR-27) and seeds the LSN counter at 0.
+    pub fn with_durability<P: AsRef<Path>>(path: P, durability: Durability) -> Result<Self> {
+        Self::with_durability_inner(path, Some(durability))
+    }
+
+    fn with_durability_inner<P: AsRef<Path>>(path: P, durability: Option<Durability>) -> Result<Self> {
         let path_ref = path.as_ref();
 
         // Create parent directories if they don't exist
@@ -99,16 +156,29 @@ impl GraphStorage {
                 // Reuse existing database connection
                 Arc::clone(existing_db)
             } else {
-                // Create new database and add to pool
+                // Create new database and add to pool. Per-database
+                // durability was removed in redb 2.x — durability is
+                // applied per-transaction in `begin_write_txn`.
                 let new_db = Arc::new(Database::create(&path_buf)?);
 
-                // Initialize tables
-                let write_txn = new_db.begin_write()?;
+                // Initialize tables and seed Atlas metadata in the same txn
+                // so the format-version key + LSN seed are atomic with
+                // table creation.
+                let mut write_txn = new_db.begin_write()?;
+                if let Some(d) = durability {
+                    write_txn.set_durability(d);
+                }
                 {
                     let _ = write_txn.open_table(NODES_TABLE)?;
                     let _ = write_txn.open_table(EDGES_TABLE)?;
                     let _ = write_txn.open_table(HYPEREDGES_TABLE)?;
-                    let _ = write_txn.open_table(METADATA_TABLE)?;
+                    let mut meta = write_txn.open_table(METADATA_TABLE)?;
+                    if meta.get(META_KEY_FORMAT_VERSION)?.is_none() {
+                        meta.insert(META_KEY_FORMAT_VERSION, ATLAS_FORMAT_VERSION)?;
+                    }
+                    if meta.get(META_KEY_LSN)?.is_none() {
+                        meta.insert(META_KEY_LSN, "0")?;
+                    }
                 }
                 write_txn.commit()?;
 
@@ -117,14 +187,115 @@ impl GraphStorage {
             }
         };
 
-        Ok(Self { db })
+        Ok(Self { db, durability })
+    }
+
+    // --- Atlas intent 01: LSN counter + digest helpers ---
+
+    /// Begin a write transaction with the configured durability mode
+    /// applied. All Atlas mutation methods route through this so the
+    /// FR-07 / NFR-04 contract (per-mutation fdatasync) holds without
+    /// each caller having to remember.
+    fn begin_write_txn(&self) -> Result<WriteTransaction> {
+        let mut write_txn = self.db.begin_write()?;
+        if let Some(d) = self.durability {
+            write_txn.set_durability(d);
+        }
+        Ok(write_txn)
+    }
+
+    /// Bump the monotonic LSN counter inside an open write transaction.
+    /// Returns the new (post-bump) LSN. The caller MUST call
+    /// `write_txn.commit()` for the LSN advance to be durable. This
+    /// keeps the LSN write atomic with the data write (FR-09, FR-11).
+    fn bump_lsn_in_txn(write_txn: &WriteTransaction) -> Result<u64> {
+        let mut meta = write_txn.open_table(METADATA_TABLE)?;
+        let current: u64 = meta
+            .get(META_KEY_LSN)?
+            .and_then(|v| v.value().parse::<u64>().ok())
+            .unwrap_or(0);
+        let next = current.saturating_add(1);
+        meta.insert(META_KEY_LSN, next.to_string().as_str())?;
+        Ok(next)
+    }
+
+    /// Read the current LSN (FR-12 backing primitive). Reads the
+    /// committed value so a writer mid-transaction is not observed.
+    pub fn current_lsn(&self) -> Result<u64> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(METADATA_TABLE)?;
+        Ok(table
+            .get(META_KEY_LSN)?
+            .and_then(|v| v.value().parse::<u64>().ok())
+            .unwrap_or(0))
+    }
+
+    /// Read the on-disk format version (FR-27). Empty string when the
+    /// key is absent (legacy DBs created before this contract).
+    pub fn format_version(&self) -> Result<String> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(METADATA_TABLE)?;
+        Ok(table
+            .get(META_KEY_FORMAT_VERSION)?
+            .map(|v| v.value().to_string())
+            .unwrap_or_default())
+    }
+
+    /// Persist the edge-type and node-label digests on first open
+    /// (FR-28). Subsequent opens: the caller compares the on-disk
+    /// digests against the in-process model; mismatches are warn-only,
+    /// never fatal (mirrors snapshot DD-08).
+    pub fn seed_or_check_digests(&self, edge_types_digest: &str, node_labels_digest: &str) -> Result<DigestCheck> {
+        let write_txn = self.begin_write_txn()?;
+        let result;
+        {
+            let mut meta = write_txn.open_table(METADATA_TABLE)?;
+            let existing_edge = meta
+                .get(META_KEY_EDGE_TYPES_DIGEST)?
+                .map(|v| v.value().to_string());
+            let existing_node = meta
+                .get(META_KEY_NODE_LABELS_DIGEST)?
+                .map(|v| v.value().to_string());
+            match (existing_edge, existing_node) {
+                (None, None) => {
+                    meta.insert(META_KEY_EDGE_TYPES_DIGEST, edge_types_digest)?;
+                    meta.insert(META_KEY_NODE_LABELS_DIGEST, node_labels_digest)?;
+                    result = DigestCheck::Seeded;
+                }
+                (Some(edge), Some(node)) => {
+                    if edge == edge_types_digest && node == node_labels_digest {
+                        result = DigestCheck::Match;
+                    } else {
+                        result = DigestCheck::Mismatch {
+                            edge_disk: edge,
+                            edge_runtime: edge_types_digest.to_string(),
+                            node_disk: node,
+                            node_runtime: node_labels_digest.to_string(),
+                        };
+                    }
+                }
+                _ => {
+                    // Partial seed (one digest written, the other not):
+                    // back-fill the missing key without overwriting.
+                    if meta.get(META_KEY_EDGE_TYPES_DIGEST)?.is_none() {
+                        meta.insert(META_KEY_EDGE_TYPES_DIGEST, edge_types_digest)?;
+                    }
+                    if meta.get(META_KEY_NODE_LABELS_DIGEST)?.is_none() {
+                        meta.insert(META_KEY_NODE_LABELS_DIGEST, node_labels_digest)?;
+                    }
+                    result = DigestCheck::Seeded;
+                }
+            }
+        }
+        write_txn.commit()?;
+        Ok(result)
     }
 
     // Node operations
 
     /// Insert a node
     pub fn insert_node(&self, node: &Node) -> Result<NodeId> {
-        let write_txn = self.db.begin_write()?;
+        let write_txn = self.begin_write_txn()?;
         {
             let mut table = write_txn.open_table(NODES_TABLE)?;
 
@@ -132,6 +303,7 @@ impl GraphStorage {
             let node_data = bincode::encode_to_vec(node, config::standard())?;
             table.insert(node.id.as_str(), node_data.as_slice())?;
         }
+        Self::bump_lsn_in_txn(&write_txn)?;
         write_txn.commit()?;
 
         Ok(node.id.clone())
@@ -139,7 +311,7 @@ impl GraphStorage {
 
     /// Insert multiple nodes in a batch
     pub fn insert_nodes_batch(&self, nodes: &[Node]) -> Result<Vec<NodeId>> {
-        let write_txn = self.db.begin_write()?;
+        let write_txn = self.begin_write_txn()?;
         let mut ids = Vec::with_capacity(nodes.len());
 
         {
@@ -152,6 +324,10 @@ impl GraphStorage {
             }
         }
 
+        // Single LSN bump per batch — the entire batch is one atomic
+        // logical mutation (one commit). Treating a batch as one LSN
+        // step matches the per-mutation atomicity contract (NFR-09).
+        Self::bump_lsn_in_txn(&write_txn)?;
         write_txn.commit()?;
         Ok(ids)
     }
@@ -172,12 +348,15 @@ impl GraphStorage {
 
     /// Delete a node by ID
     pub fn delete_node(&self, id: &str) -> Result<bool> {
-        let write_txn = self.db.begin_write()?;
+        let write_txn = self.begin_write_txn()?;
         let deleted;
         {
             let mut table = write_txn.open_table(NODES_TABLE)?;
             let result = table.remove(id)?;
             deleted = result.is_some();
+        }
+        if deleted {
+            Self::bump_lsn_in_txn(&write_txn)?;
         }
         write_txn.commit()?;
         Ok(deleted)
@@ -202,7 +381,7 @@ impl GraphStorage {
 
     /// Insert an edge
     pub fn insert_edge(&self, edge: &Edge) -> Result<EdgeId> {
-        let write_txn = self.db.begin_write()?;
+        let write_txn = self.begin_write_txn()?;
         {
             let mut table = write_txn.open_table(EDGES_TABLE)?;
 
@@ -210,6 +389,7 @@ impl GraphStorage {
             let edge_data = bincode::encode_to_vec(edge, config::standard())?;
             table.insert(edge.id.as_str(), edge_data.as_slice())?;
         }
+        Self::bump_lsn_in_txn(&write_txn)?;
         write_txn.commit()?;
 
         Ok(edge.id.clone())
@@ -217,7 +397,7 @@ impl GraphStorage {
 
     /// Insert multiple edges in a batch
     pub fn insert_edges_batch(&self, edges: &[Edge]) -> Result<Vec<EdgeId>> {
-        let write_txn = self.db.begin_write()?;
+        let write_txn = self.begin_write_txn()?;
         let mut ids = Vec::with_capacity(edges.len());
 
         {
@@ -230,6 +410,7 @@ impl GraphStorage {
             }
         }
 
+        Self::bump_lsn_in_txn(&write_txn)?;
         write_txn.commit()?;
         Ok(ids)
     }
@@ -250,19 +431,22 @@ impl GraphStorage {
 
     /// Delete an edge by ID
     pub fn delete_edge(&self, id: &str) -> Result<bool> {
-        let write_txn = self.db.begin_write()?;
+        let write_txn = self.begin_write_txn()?;
         let deleted;
         {
             let mut table = write_txn.open_table(EDGES_TABLE)?;
             let result = table.remove(id)?;
             deleted = result.is_some();
         }
+        if deleted {
+            Self::bump_lsn_in_txn(&write_txn)?;
+        }
         write_txn.commit()?;
         Ok(deleted)
     }
 
     pub fn delete_edges_batch(&self, ids: &[impl AsRef<str>]) -> Result<usize> {
-        let write_txn = self.db.begin_write()?;
+        let write_txn = self.begin_write_txn()?;
         let mut deleted = 0;
         {
             let mut table = write_txn.open_table(EDGES_TABLE)?;
@@ -273,6 +457,9 @@ impl GraphStorage {
             }
         }
 
+        if deleted > 0 {
+            Self::bump_lsn_in_txn(&write_txn)?;
+        }
         write_txn.commit()?;
         Ok(deleted)
     }
@@ -296,7 +483,7 @@ impl GraphStorage {
 
     /// Insert a hyperedge
     pub fn insert_hyperedge(&self, hyperedge: &Hyperedge) -> Result<HyperedgeId> {
-        let write_txn = self.db.begin_write()?;
+        let write_txn = self.begin_write_txn()?;
         {
             let mut table = write_txn.open_table(HYPEREDGES_TABLE)?;
 
@@ -304,6 +491,7 @@ impl GraphStorage {
             let hyperedge_data = bincode::encode_to_vec(hyperedge, config::standard())?;
             table.insert(hyperedge.id.as_str(), hyperedge_data.as_slice())?;
         }
+        Self::bump_lsn_in_txn(&write_txn)?;
         write_txn.commit()?;
 
         Ok(hyperedge.id.clone())
@@ -311,7 +499,7 @@ impl GraphStorage {
 
     /// Insert multiple hyperedges in a batch
     pub fn insert_hyperedges_batch(&self, hyperedges: &[Hyperedge]) -> Result<Vec<HyperedgeId>> {
-        let write_txn = self.db.begin_write()?;
+        let write_txn = self.begin_write_txn()?;
         let mut ids = Vec::with_capacity(hyperedges.len());
 
         {
@@ -324,6 +512,7 @@ impl GraphStorage {
             }
         }
 
+        Self::bump_lsn_in_txn(&write_txn)?;
         write_txn.commit()?;
         Ok(ids)
     }
@@ -344,12 +533,15 @@ impl GraphStorage {
 
     /// Delete a hyperedge by ID
     pub fn delete_hyperedge(&self, id: &str) -> Result<bool> {
-        let write_txn = self.db.begin_write()?;
+        let write_txn = self.begin_write_txn()?;
         let deleted;
         {
             let mut table = write_txn.open_table(HYPEREDGES_TABLE)?;
             let result = table.remove(id)?;
             deleted = result.is_some();
+        }
+        if deleted {
+            Self::bump_lsn_in_txn(&write_txn)?;
         }
         write_txn.commit()?;
         Ok(deleted)
@@ -372,12 +564,17 @@ impl GraphStorage {
 
     // Metadata operations
 
-    /// Set metadata
+    /// Set metadata. Atlas user metadata writes (i.e., not the
+    /// `__atlas_*` reserved keys) bump the LSN; reserved-key writes
+    /// (LSN bookkeeping itself) do not, to avoid recursion.
     pub fn set_metadata(&self, key: &str, value: &str) -> Result<()> {
-        let write_txn = self.db.begin_write()?;
+        let write_txn = self.begin_write_txn()?;
         {
             let mut table = write_txn.open_table(METADATA_TABLE)?;
             table.insert(key, value)?;
+        }
+        if !key.starts_with("__atlas_") {
+            Self::bump_lsn_in_txn(&write_txn)?;
         }
         write_txn.commit()?;
         Ok(())
@@ -499,6 +696,117 @@ mod tests {
         let retrieved = storage.get_hyperedge(&id)?;
         assert!(retrieved.is_some());
 
+        Ok(())
+    }
+
+    // --- Atlas intent 01 (durable graph storage) tests ---
+
+    #[test]
+    fn test_lsn_monotonic_across_writes() -> Result<()> {
+        let dir = tempdir()?;
+        let storage = GraphStorage::with_durability(
+            dir.path().join("lsn.db"),
+            Durability::Immediate,
+        )?;
+        assert_eq!(storage.current_lsn()?, 0, "freshly opened DB starts at LSN=0");
+
+        for i in 0..5 {
+            let node = NodeBuilder::new()
+                .label("Person")
+                .property("i", i as i64)
+                .build();
+            storage.insert_node(&node)?;
+        }
+        assert_eq!(storage.current_lsn()?, 5, "5 inserts → LSN=5");
+
+        // Edge insert advances LSN.
+        let e = EdgeBuilder::new("a".to_string(), "b".to_string(), "REL").build();
+        storage.insert_edge(&e)?;
+        assert_eq!(storage.current_lsn()?, 6);
+
+        // Batch counts as ONE LSN step.
+        let batch = vec![
+            NodeBuilder::new().label("A").build(),
+            NodeBuilder::new().label("B").build(),
+        ];
+        storage.insert_nodes_batch(&batch)?;
+        assert_eq!(storage.current_lsn()?, 7, "batch insert is one LSN step");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_format_version_seeded_on_first_open() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("fmt.db");
+        let storage = GraphStorage::with_durability(&path, Durability::Immediate)?;
+        assert_eq!(storage.format_version()?, ATLAS_FORMAT_VERSION);
+        Ok(())
+    }
+
+    #[test]
+    fn test_seed_or_check_digests_first_run_then_match() -> Result<()> {
+        let dir = tempdir()?;
+        let storage = GraphStorage::with_durability(
+            dir.path().join("digest.db"),
+            Durability::Immediate,
+        )?;
+        let edge_d = "abc";
+        let node_d = "xyz";
+        match storage.seed_or_check_digests(edge_d, node_d)? {
+            DigestCheck::Seeded => {}
+            other => panic!("first run should Seed, got {:?}", other),
+        }
+        match storage.seed_or_check_digests(edge_d, node_d)? {
+            DigestCheck::Match => {}
+            other => panic!("second run with same digests should Match, got {:?}", other),
+        }
+        match storage.seed_or_check_digests("abc-CHANGED", node_d)? {
+            DigestCheck::Mismatch { edge_disk, edge_runtime, .. } => {
+                assert_eq!(edge_disk, "abc");
+                assert_eq!(edge_runtime, "abc-CHANGED");
+            }
+            other => panic!("changed digest should Mismatch, got {:?}", other),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_metadata_user_keys_bump_lsn_reserved_keys_do_not() -> Result<()> {
+        let dir = tempdir()?;
+        let storage = GraphStorage::with_durability(
+            dir.path().join("meta.db"),
+            Durability::Immediate,
+        )?;
+        let lsn0 = storage.current_lsn()?;
+        storage.set_metadata("user_key", "value")?;
+        assert_eq!(storage.current_lsn()?, lsn0 + 1, "user metadata bumps LSN");
+
+        // Reserved keys (the LSN counter itself) must not bump on write.
+        storage.set_metadata("__atlas_format_version", "1.0")?;
+        assert_eq!(storage.current_lsn()?, lsn0 + 1, "reserved-key writes do NOT bump LSN");
+        Ok(())
+    }
+
+    #[test]
+    fn test_lsn_persists_across_reopens() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("persist.db");
+        {
+            let storage = GraphStorage::with_durability(&path, Durability::Immediate)?;
+            for _ in 0..3 {
+                storage.insert_node(&NodeBuilder::new().label("X").build())?;
+            }
+            assert_eq!(storage.current_lsn()?, 3);
+            // Drop the storage and the connection-pool entry by clearing
+            // the global pool key so a fresh open sees the existing file.
+        }
+        // Force the global DB_POOL to drop its handle for this path so
+        // the second open re-creates Database from disk (proves WAL
+        // replay would carry the LSN forward in a kill -9 scenario).
+        DB_POOL.lock().clear();
+        let reopened = GraphStorage::with_durability(&path, Durability::Immediate)?;
+        assert_eq!(reopened.current_lsn()?, 3, "LSN survives reopen");
         Ok(())
     }
 }

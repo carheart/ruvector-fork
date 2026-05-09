@@ -67,6 +67,34 @@ impl GraphDB {
         Ok(db)
     }
 
+    /// Create a new graph database with persistent storage and an
+    /// explicit durability mode (Atlas FR-08). Pass
+    /// `redb::Durability::Immediate` for production Electron mode (per-
+    /// mutation fsync); `Durability::Eventual` matches v0 default.
+    #[cfg(feature = "storage")]
+    pub fn with_storage_durability<P: AsRef<Path>>(
+        path: P,
+        durability: redb::Durability,
+    ) -> anyhow::Result<Self> {
+        let storage = GraphStorage::with_durability(path, durability)?;
+
+        let mut db = Self::new();
+        db.storage = Some(storage);
+
+        db.load_from_storage()?;
+        Ok(db)
+    }
+
+    /// Read the underlying storage's LSN (Atlas FR-12). Returns 0 when
+    /// the GraphDB is in-memory (no storage backend attached).
+    #[cfg(feature = "storage")]
+    pub fn lsn(&self) -> anyhow::Result<u64> {
+        match &self.storage {
+            Some(s) => s.current_lsn(),
+            None => Ok(0),
+        }
+    }
+
     /// Load all data from storage into memory
     #[cfg(feature = "storage")]
     fn load_from_storage(&mut self) -> anyhow::Result<()> {
@@ -346,7 +374,7 @@ impl GraphDB {
             .collect()
     }
 
-    /// Delete a hyperedge by ID
+    /// Delete a hyperedge by ID. Returns true if it existed.
     pub fn delete_hyperedge(&self, id: &HyperedgeId) -> Result<bool> {
         if let Some((_, hyperedge)) = self.hyperedges.remove(id) {
             self.hyperedge_node_index.remove_hyperedge(&hyperedge);
@@ -360,20 +388,6 @@ impl GraphDB {
         } else {
             Ok(false)
         }
-    }
-
-    /// Delete all hyperedges that contain a given node
-    pub fn delete_hyperedges_by_node(&self, node_id: &NodeId) -> Result<usize> {
-        let ids: Vec<HyperedgeId> = self
-            .hyperedge_node_index
-            .get_hyperedges_by_node(node_id);
-        let mut deleted = 0;
-        for id in &ids {
-            if self.delete_hyperedge(id)? {
-                deleted += 1;
-            }
-        }
-        Ok(deleted)
     }
 
     /// List all hyperedges in the graph
