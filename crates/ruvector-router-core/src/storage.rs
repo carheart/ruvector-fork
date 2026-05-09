@@ -13,6 +13,13 @@ const VECTORS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("vector
 const METADATA_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("metadata");
 const INDEX_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("index");
 
+// Atlas intent 01 (FR-20a): per-collection LSN counter stored in
+// METADATA_TABLE under a reserved key. Value is u64 little-endian
+// bytes — fixed 8-byte payload, no serde overhead. Bumped in the same
+// write_txn as every vector mutation so the LSN advance is atomic
+// with the data write.
+const META_KEY_ATLAS_LSN: &str = "__atlas_lsn";
+
 /// Storage backend for vector database
 pub struct Storage {
     db: Arc<Database>,
@@ -126,6 +133,7 @@ impl Storage {
             table.insert(entry.id.as_str(), metadata_bytes.as_slice())?;
         }
 
+        bump_lsn_in_txn(&write_txn)?;
         write_txn.commit()?;
 
         // Update cache
@@ -160,6 +168,7 @@ impl Storage {
             }
         }
 
+        bump_lsn_in_txn(&write_txn)?;
         write_txn.commit()?;
 
         // Update cache
@@ -238,6 +247,9 @@ impl Storage {
             table.remove(id)?;
         }
 
+        if deleted {
+            bump_lsn_in_txn(&write_txn)?;
+        }
         write_txn.commit()?;
 
         // Remove from cache
@@ -299,6 +311,50 @@ impl Storage {
             Ok(None)
         }
     }
+
+    /// Atlas FR-20a: read the current monotonic LSN. Returns 0 when
+    /// the metadata table or key is missing (legacy DBs created before
+    /// this contract).
+    pub fn current_lsn(&self) -> Result<u64> {
+        let read_txn = self.db.begin_read()?;
+        let table = match read_txn.open_table(METADATA_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(0),
+            Err(e) => return Err(e.into()),
+        };
+        match table.get(META_KEY_ATLAS_LSN)? {
+            Some(bytes) => {
+                let v = bytes.value();
+                if v.len() == 8 {
+                    let mut buf = [0u8; 8];
+                    buf.copy_from_slice(v);
+                    Ok(u64::from_le_bytes(buf))
+                } else {
+                    Ok(0)
+                }
+            }
+            None => Ok(0),
+        }
+    }
+}
+
+/// Atlas FR-20a: bump the per-collection monotonic LSN counter inside
+/// an open write transaction. Free function so each public mutation
+/// method calls it from inside its own write_txn (atomic with the
+/// data write — no separate transaction).
+fn bump_lsn_in_txn(write_txn: &redb::WriteTransaction) -> Result<()> {
+    let mut meta = write_txn.open_table(METADATA_TABLE)?;
+    let current: u64 = match meta.get(META_KEY_ATLAS_LSN)? {
+        Some(bytes) if bytes.value().len() == 8 => {
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(bytes.value());
+            u64::from_le_bytes(buf)
+        }
+        _ => 0,
+    };
+    let next = current.saturating_add(1);
+    meta.insert(META_KEY_ATLAS_LSN, &next.to_le_bytes()[..])?;
+    Ok(())
 }
 
 #[cfg(test)]
