@@ -262,7 +262,18 @@ impl VectorDB {
 
         if deleted {
             self.index.remove(id)?;
-            self.stats.write().total_vectors = self.stats.write().total_vectors.saturating_sub(1);
+            // parking_lot::RwLock is non-reentrant. The historic
+            // single-statement form
+            //   `self.stats.write().total_vectors = self.stats.write()
+            //                                            .total_vectors
+            //                                            .saturating_sub(1);`
+            // deadlocks: the RHS write guard is not dropped before the
+            // LHS write call acquires the same lock. Bind the guard to
+            // a local so it drops at the end of the statement (Atlas
+            // commit 72884383 — re-applied after upstream refresh
+            // bec3f347 reintroduced the deadlock).
+            let mut stats = self.stats.write();
+            stats.total_vectors = stats.total_vectors.saturating_sub(1);
         }
 
         Ok(deleted)
@@ -297,6 +308,14 @@ impl VectorDB {
     /// Get all vector IDs
     pub fn get_all_ids(&self) -> Result<Vec<String>> {
         self.storage.get_all_ids()
+    }
+
+    /// Atlas FR-20a: read the current monotonic LSN of the underlying
+    /// per-collection redb store. Bumped atomically with every
+    /// upsert/delete (see `Storage::insert` / `insert_batch` /
+    /// `delete`). Returns 0 for legacy DBs predating this contract.
+    pub fn current_lsn(&self) -> Result<u64> {
+        self.storage.current_lsn()
     }
 }
 
