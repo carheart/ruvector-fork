@@ -186,11 +186,12 @@ impl GraphDB {
         }
     }
 
-    /// Update an existing node's properties in place.
+    /// Atomically update an existing node.
     ///
-    /// Fetches the node by ID, applies the provided closure to mutate its
-    /// properties (via `Node::set_property`, `add_label`, etc.), and persists
-    /// the change. Indexes are refreshed to reflect the new property values.
+    /// Applies `f` to a clone of the current node, persists the new value, and
+    /// refreshes the label and property indexes. Concurrent updates to the same
+    /// node are serialized, so one update cannot silently overwrite another.
+    /// The node ID is immutable and changing it returns a constraint error.
     ///
     /// Returns `Ok(false)` if the node was not found (no error), `Ok(true)` if
     /// updated successfully. This is the counterpart to `create_node` and
@@ -205,36 +206,39 @@ impl GraphDB {
     ///     n.set_property("deprecated_at", PropertyValue::from(now_iso8601));
     /// })?;
     /// ```
+    ///
+    /// The callback runs while the node's map shard is write-locked. It must
+    /// not call back into this `GraphDB`, because doing so may deadlock.
     pub fn update_node<F>(&self, id: impl AsRef<str>, f: F) -> Result<bool>
     where
         F: FnOnce(&mut Node),
     {
         let id_ref = id.as_ref();
-        // Clone out, mutate, write back (avoids holding the lock during f).
-        let Some(mut node) = self.get_node(id_ref) else {
+        let Some(mut entry) = self.nodes.get_mut(id_ref) else {
             return Ok(false);
         };
-        f(&mut node);
+        let old_node = entry.value().clone();
+        let mut new_node = old_node.clone();
+        f(&mut new_node);
 
-        // Remove old index entries, then re-add for the updated node.
-        // We need the pre-mutation state for index removal, so we re-fetch
-        // is not possible — instead, remove by id and re-add (indexes are
-        // idempotent on add after remove).
-        // Simpler: remove + re-add using the updated node.
-        // label_index and property_index are add-only in the current API,
-        // so we remove the old entry by reconstructing from the original.
-        // To keep this O(1) and simple, we just re-insert; duplicate index
-        // entries are acceptable for property lookups (they return the same
-        // node id). For a production PR, the index should expose an
-        // `update_node` method — this is a minimal, correct implementation.
+        if new_node.id != old_node.id {
+            return Err(crate::error::GraphError::ConstraintViolation(
+                "A node's ID cannot be changed by update_node".to_string(),
+            ));
+        }
 
-        self.nodes.insert(id_ref.to_string(), node.clone());
-
-        // Persist to storage if available
+        // Persist before changing memory so a storage error leaves the live
+        // node and its indexes untouched.
         #[cfg(feature = "storage")]
         if let Some(storage) = &self.storage {
-            storage.insert_node(&node)?;
+            storage.insert_node(&new_node)?;
         }
+
+        self.label_index.remove_node(&old_node);
+        self.property_index.remove_node(&old_node);
+        *entry.value_mut() = new_node.clone();
+        self.label_index.add_node(&new_node);
+        self.property_index.add_node(&new_node);
 
         Ok(true)
     }
@@ -264,15 +268,17 @@ impl GraphDB {
         k: usize,
     ) -> Result<Vec<(NodeId, f32)>> {
         let docs: Vec<(NodeId, String)> = self
-            .get_nodes_by_label(label)
+            .node_ids_by_label(label)
             .into_iter()
-            .filter_map(|n| {
-                n.get_property(text_field)
-                    .and_then(|v| match v {
+            .filter_map(|id| {
+                self.with_node(&id, |node| {
+                    node.get_property(text_field).and_then(|value| match value {
                         PropertyValue::String(s) => Some(s.clone()),
                         _ => None,
                     })
-                    .map(|s| (n.id.clone(), s))
+                })
+                .flatten()
+                .map(|text| (id, text))
             })
             .collect();
 
@@ -280,10 +286,7 @@ impl GraphDB {
             return Ok(Vec::new());
         }
 
-        let index = crate::bm25::Bm25Index::build(
-            docs.into_iter().map(|(id, s)| (id, s)),
-            crate::bm25::Bm25Params::default(),
-        );
+        let index = crate::bm25::Bm25Index::build(docs, crate::bm25::Bm25Params::default());
         Ok(index.search(query, k))
     }
 
@@ -545,6 +548,7 @@ mod tests {
     use crate::edge::EdgeBuilder;
     use crate::hyperedge::HyperedgeBuilder;
     use crate::node::NodeBuilder;
+    use std::sync::{Arc, Barrier};
 
     #[test]
     fn test_graph_creation() {
@@ -665,6 +669,121 @@ mod tests {
             &PropertyValue::from("deprecated")
         );
         assert!(retrieved.get_property("deprecated_at").is_some());
+
+        assert!(db
+            .get_nodes_by_property("status", &PropertyValue::from("active"))
+            .is_empty());
+        assert_eq!(
+            db.get_nodes_by_property("status", &PropertyValue::from("deprecated"))
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_update_node_refreshes_label_and_property_indexes() {
+        let db = GraphDB::new();
+        db.create_node(
+            NodeBuilder::new()
+                .id("indexed")
+                .label("OldLabel")
+                .property("state", "old")
+                .property("removed", true)
+                .build(),
+        )
+        .unwrap();
+
+        db.update_node("indexed", |node| {
+            node.remove_label("OldLabel");
+            node.add_label("NewLabel");
+            node.set_property("state", PropertyValue::from("new"));
+            node.properties.remove("removed");
+        })
+        .unwrap();
+
+        assert!(db.get_nodes_by_label("OldLabel").is_empty());
+        assert_eq!(db.get_nodes_by_label("NewLabel").len(), 1);
+        assert!(db
+            .get_nodes_by_property("state", &PropertyValue::from("old"))
+            .is_empty());
+        assert_eq!(
+            db.get_nodes_by_property("state", &PropertyValue::from("new"))
+                .len(),
+            1
+        );
+        assert!(db
+            .get_nodes_by_property("removed", &PropertyValue::from(true))
+            .is_empty());
+    }
+
+    #[test]
+    fn test_update_node_rejects_id_changes_without_side_effects() {
+        let db = GraphDB::new();
+        db.create_node(NodeBuilder::new().id("original").label("Old").build())
+            .unwrap();
+
+        let error = db
+            .update_node("original", |node| {
+                node.id = "replacement".to_string();
+                node.add_label("New");
+            })
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            crate::error::GraphError::ConstraintViolation(_)
+        ));
+        assert!(db.get_node("replacement").is_none());
+        assert!(db.get_node("original").unwrap().has_label("Old"));
+        assert!(db.get_nodes_by_label("New").is_empty());
+    }
+
+    #[test]
+    fn test_concurrent_updates_do_not_lose_writes() {
+        const THREADS: usize = 8;
+        const UPDATES_PER_THREAD: usize = 100;
+
+        let db = Arc::new(GraphDB::new());
+        db.create_node(
+            NodeBuilder::new()
+                .id("counter")
+                .property("value", 0_i64)
+                .build(),
+        )
+        .unwrap();
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let mut handles = Vec::new();
+
+        for _ in 0..THREADS {
+            let db = Arc::clone(&db);
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..UPDATES_PER_THREAD {
+                    db.update_node("counter", |node| {
+                        let value = match node.get_property("value") {
+                            Some(PropertyValue::Integer(value)) => *value,
+                            _ => panic!("counter property is missing"),
+                        };
+                        node.set_property("value", PropertyValue::Integer(value + 1));
+                    })
+                    .unwrap();
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        assert_eq!(
+            db.get_node("counter")
+                .unwrap()
+                .get_property("value")
+                .cloned(),
+            Some(PropertyValue::Integer(
+                (THREADS * UPDATES_PER_THREAD) as i64
+            ))
+        );
     }
 
     #[test]
@@ -711,5 +830,79 @@ mod tests {
             .keyword_search("Nonexistent", "content", "anything", 5)
             .unwrap();
         assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn test_keyword_search_ignores_other_labels_and_non_string_fields() {
+        let db = GraphDB::new();
+        for node in [
+            NodeBuilder::new()
+                .id("wanted")
+                .label("Memory")
+                .property("content", "unique needle")
+                .build(),
+            NodeBuilder::new()
+                .id("wrong-label")
+                .label("Other")
+                .property("content", "unique needle")
+                .build(),
+            NodeBuilder::new()
+                .id("wrong-type")
+                .label("Memory")
+                .property("content", 42_i64)
+                .build(),
+        ] {
+            db.create_node(node).unwrap();
+        }
+
+        let hits = db
+            .keyword_search("Memory", "content", "needle", 10)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, "wanted");
+        assert!(db
+            .keyword_search("Memory", "content", "needle", 0)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[cfg(feature = "storage")]
+    #[test]
+    fn test_update_node_persists() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("graph.redb");
+
+        {
+            let db = GraphDB::with_storage(&path).unwrap();
+            db.create_node(
+                NodeBuilder::new()
+                    .id("persistent")
+                    .label("Old")
+                    .property("state", "old")
+                    .build(),
+            )
+            .unwrap();
+            db.update_node("persistent", |node| {
+                node.remove_label("Old");
+                node.add_label("New");
+                node.set_property("state", PropertyValue::from("new"));
+            })
+            .unwrap();
+        }
+
+        let reopened = GraphDB::with_storage(&path).unwrap();
+        let node = reopened.get_node("persistent").unwrap();
+        assert!(node.has_label("New"));
+        assert_eq!(
+            node.get_property("state"),
+            Some(&PropertyValue::from("new"))
+        );
+        assert_eq!(reopened.get_nodes_by_label("New").len(), 1);
+        assert_eq!(
+            reopened
+                .get_nodes_by_property("state", &PropertyValue::from("new"))
+                .len(),
+            1
+        );
     }
 }
