@@ -3,6 +3,7 @@
 //! A high-performance graph database layer built on RuVector with Neo4j compatibility.
 //! Supports property graphs, hypergraphs, Cypher queries, ACID transactions, and distributed queries.
 
+pub mod bm25;
 pub mod cypher;
 pub mod edge;
 pub mod error;
@@ -26,6 +27,7 @@ pub mod hybrid;
 pub mod distributed;
 
 // Core type re-exports
+pub use bm25::{Bm25Index, Bm25Params};
 pub use edge::{Edge, EdgeBuilder};
 pub use error::{GraphError, Result};
 pub use graph::GraphDB;
