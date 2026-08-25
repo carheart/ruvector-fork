@@ -56,8 +56,15 @@ const ATLAS_FORMAT_VERSION: &str = "1.0";
 
 #[cfg(feature = "storage")]
 // Global database connection pool to allow multiple GraphStorage instances
-// to share the same underlying database file
-static DB_POOL: Lazy<Mutex<HashMap<PathBuf, Arc<Database>>>> =
+// to share the same underlying database file.
+//
+// prco patch (B-1): entries are WEAK — the pool no longer keeps the Database
+// (and its file lock) alive after the last GraphStorage drops. A strong-Arc
+// pool held the redb lock for the entire process lifetime, so a long-lived
+// consumer (an MCP server) that opened the db once blocked every other
+// process forever. Weak entries mean: live handles are still shared, and
+// dropping the last handle releases the lock; a later open re-creates.
+static DB_POOL: Lazy<Mutex<HashMap<PathBuf, std::sync::Weak<Database>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
 #[cfg(feature = "storage")]
@@ -152,9 +159,9 @@ impl GraphStorage {
         let db = {
             let mut pool = DB_POOL.lock();
 
-            if let Some(existing_db) = pool.get(&path_buf) {
-                // Reuse existing database connection
-                Arc::clone(existing_db)
+            if let Some(existing_db) = pool.get(&path_buf).and_then(std::sync::Weak::upgrade) {
+                // Reuse a still-live database connection
+                existing_db
             } else {
                 // Create new database and add to pool. Per-database
                 // durability was removed in redb 2.x — durability is
@@ -182,7 +189,7 @@ impl GraphStorage {
                 }
                 write_txn.commit()?;
 
-                pool.insert(path_buf, Arc::clone(&new_db));
+                pool.insert(path_buf, Arc::downgrade(&new_db));
                 new_db
             }
         };
